@@ -5,6 +5,8 @@ const cors = require('cors');
 const twilio = require('twilio');
 const { createClient: createSupabaseClient } = require('@supabase/supabase-js');
 const axios = require('axios');
+const WebSocket = require('ws');
+const { createClient: createDeepgramClient } = require('@deepgram/sdk');
 
 // Initialize
 const app = express();
@@ -48,24 +50,21 @@ YOUR JOB:
 IMPORTANT: Be natural and helpful. Don't use bullet points in conversation.`;
 
 // Available slots (simplified)
-const availableSlots = {
-  'Monday': ['9:00 AM', '10:00 AM', '2:00 PM', '3:00 PM', '4:00 PM'],
-  'Tuesday': ['9:00 AM', '10:00 AM', '2:00 PM', '3:00 PM', '4:00 PM'],
-  'Wednesday': ['9:00 AM', '10:00 AM', '2:00 PM', '3:00 PM', '4:00 PM'],
-  'Thursday': ['9:00 AM', '10:00 AM', '2:00 PM', '3:00 PM', '4:00 PM'],
-  'Friday': ['9:00 AM', '10:00 AM', '2:00 PM', '3:00 PM', '4:00 PM'],
-  'Saturday': ['9:00 AM', '10:00 AM', '2:00 PM', '3:00 PM']
-};
+const availableSlots = [
+  '9:00 AM', '10:00 AM', '11:00 AM', '12:00 PM',
+  '2:00 PM', '3:00 PM', '4:00 PM', '5:00 PM'
+];
 
 // Health check
 app.get('/', (req, res) => {
   res.json({
     status: 'running',
-    service: 'Clinic Voice Agent (FREE Version)',
-    clinic: process.env.CLINIC_NAME,
+    service: 'Clinic Voice Agent + AI Calling',
+    clinic: process.env.CLINIC_NAME || 'Dental Clinic',
     features: {
+      voice: 'enabled (AI-powered)',
       whatsapp: 'enabled',
-      voice: 'enabled (text-based)',
+      sms: 'enabled',
       ai: 'Groq (Free)',
       database: 'Supabase (Free)'
     },
@@ -84,25 +83,29 @@ app.get('/status', (req, res) => {
     status: 'healthy',
     activeConversations: activeConversations.size,
     uptime: process.uptime(),
-    version: 'free'
+    version: 'voice-enabled'
   });
 });
 
-// Voice endpoint (Twilio Voice)
+// Voice endpoint (Twilio Voice) - Full AI Voice
 app.post('/voice', async (req, res) => {
-  console.log('📞 Incoming call from:', req.body.From);
+  console.log('📞 Incoming voice call from:', req.body.From);
   
   const twiml = new twilio.twiml.VoiceResponse();
   
-  // Greet the caller
+  // Initial AI greeting
   twiml.say({
-    voice: 'alice',
+    voice: 'Polly.Joanna',
     language: 'en-US'
-  }, `Hello! Thank you for calling ${process.env.CLINIC_NAME}. To book an appointment, please send us a WhatsApp message or text to this number. Thank you!`);
+  }, `Hello! Welcome to ${process.env.CLINIC_NAME}. I'm your AI assistant. How can I help you today?`);
   
-  // Optionally redirect to SMS for appointment booking
   twiml.pause({ length: 1 });
-  twiml.say('You can also press any key to receive a text message with our WhatsApp number.');
+  
+  // Start WebSocket stream for real-time AI conversation
+  const connect = twiml.connect();
+  connect.stream({
+    url: `wss://${req.headers.host}/voice-stream`
+  });
   
   res.type('text/xml');
   res.send(twiml.toString());
@@ -136,12 +139,11 @@ app.post('/sms', async (req, res) => {
       content: aiResponse
     });
     
-    // Save conversation
+    // Update conversation
     activeConversations.set(fromNumber, conversation);
     
-    // Check if appointment complete
-    if (aiResponse.toLowerCase().includes('confirmed') || 
-        aiResponse.toLowerCase().includes('booked')) {
+    // Check if appointment is complete
+    if (aiResponse.toLowerCase().includes('confirmed') || aiResponse.toLowerCase().includes('booked')) {
       await saveAppointment(fromNumber, conversation);
     }
     
@@ -154,8 +156,9 @@ app.post('/sms', async (req, res) => {
     
   } catch (error) {
     console.error('SMS error:', error);
+    
     const twiml = new twilio.twiml.MessagingResponse();
-    twiml.message('Sorry, I encountered an error. Please try again or call us directly.');
+    twiml.message('Sorry, I encountered an error. Please try again.');
     res.type('text/xml');
     res.send(twiml.toString());
   }
@@ -163,8 +166,7 @@ app.post('/sms', async (req, res) => {
 
 // WhatsApp endpoint
 app.post('/whatsapp', async (req, res) => {
-  console.log('💬 WhatsApp message from:', req.body.From);
-  
+  console.log('💬 WhatsApp from:', req.body.From);
   const incomingMsg = req.body.Body;
   const fromNumber = req.body.From;
   
@@ -181,7 +183,7 @@ app.post('/whatsapp', async (req, res) => {
       content: incomingMsg
     });
     
-    // Get AI response using Groq (FREE!)
+    // Get AI response using Groq
     const aiResponse = await getGroqResponse(conversation);
     
     // Add AI response
@@ -190,12 +192,11 @@ app.post('/whatsapp', async (req, res) => {
       content: aiResponse
     });
     
-    // Save conversation
+    // Update conversation
     activeConversations.set(fromNumber, conversation);
     
     // Check if appointment is complete
-    if (aiResponse.toLowerCase().includes('confirmed') || 
-        aiResponse.toLowerCase().includes('booked')) {
+    if (aiResponse.toLowerCase().includes('confirmed') || aiResponse.toLowerCase().includes('booked')) {
       await saveAppointment(fromNumber, conversation);
     }
     
@@ -206,22 +207,16 @@ app.post('/whatsapp', async (req, res) => {
       to: fromNumber
     });
     
-    res.sendStatus(200);
+    res.type('text/xml');
+    res.send('<?xml version="1.0" encoding="UTF-8"?><Response></Response>');
     
   } catch (error) {
     console.error('WhatsApp error:', error);
-    
-    await twilioClient.messages.create({
-      body: 'Sorry, I encountered an error. Please try again or call us directly.',
-      from: process.env.TWILIO_WHATSAPP_NUMBER,
-      to: fromNumber
-    });
-    
     res.sendStatus(500);
   }
 });
 
-// Get AI response from Groq (100% FREE!)
+// Get AI response using Groq
 async function getGroqResponse(conversation) {
   try {
     const messages = [
@@ -235,7 +230,7 @@ async function getGroqResponse(conversation) {
     const response = await axios.post(
       'https://api.groq.com/openai/v1/chat/completions',
       {
-        model: 'llama-3.3-70b-versatile', // Free model
+        model: 'llama-3.3-70b-versatile',
         messages: messages,
         max_tokens: 150,
         temperature: 0.7
@@ -252,15 +247,15 @@ async function getGroqResponse(conversation) {
     
   } catch (error) {
     console.error('Groq API error:', error.response?.data || error.message);
-    return "I'm having trouble processing that right now. Could you please try again?";
+    return "I'm having trouble processing that. Could you please try again?";
   }
 }
 
 // Save appointment to Supabase
 async function saveAppointment(phoneNumber, conversation) {
+  const appointmentData = extractAppointmentData(conversation.messages);
+  
   try {
-    const appointmentData = extractAppointmentData(conversation);
-    
     const { data, error } = await supabase
       .from('appointments')
       .insert([
@@ -271,6 +266,7 @@ async function saveAppointment(phoneNumber, conversation) {
           appointment_date: appointmentData.date || new Date().toISOString(),
           appointment_time: appointmentData.time || '10:00 AM',
           status: 'confirmed',
+          notes: 'Booked via AI assistant',
           created_at: new Date().toISOString()
         }
       ]);
@@ -278,35 +274,43 @@ async function saveAppointment(phoneNumber, conversation) {
     if (error) {
       console.error('Database error:', error);
     } else {
-      console.log('✅ Appointment saved');
+      console.log('✅ Appointment saved to database');
     }
-    
   } catch (error) {
-    console.error('Save appointment error:', error);
+    console.error('Save error:', error);
   }
 }
 
-// Extract appointment data (simple keyword extraction)
-function extractAppointmentData(conversation) {
-  const data = {
-    name: null,
-    service: null,
-    date: null,
-    time: null
-  };
-  
-  const fullText = conversation.messages
+// Extract appointment data from conversation
+function extractAppointmentData(messages) {
+  const fullText = messages
     .map(m => m.content)
     .join(' ')
     .toLowerCase();
   
+  const data = {
+    service: null,
+    date: null,
+    time: null,
+    name: null
+  };
+  
   // Extract service
-  const services = ['cleaning', 'whitening', 'filling', 'root canal', 'extraction', 'checkup'];
+  const services = ['checkup', 'whitening', 'filling', 'root canal', 'extraction'];
   for (const service of services) {
     if (fullText.includes(service)) {
       data.service = service;
       break;
     }
+  }
+  
+  // Extract date
+  if (fullText.includes('tomorrow')) {
+    const tomorrow = new Date();
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    data.date = tomorrow.toISOString().split('T')[0];
+  } else if (fullText.includes('today')) {
+    data.date = new Date().toISOString().split('T')[0];
   }
   
   // Extract time
@@ -315,30 +319,259 @@ function extractAppointmentData(conversation) {
     data.time = timeMatch[0];
   }
   
+  // Extract name
+  const namePatterns = [
+    /my name is (\w+\s*\w*)/i,
+    /i am (\w+\s*\w*)/i,
+    /this is (\w+\s*\w*)/i
+  ];
+  
+  for (const pattern of namePatterns) {
+    const match = fullText.match(pattern);
+    if (match) {
+      data.name = match[1].trim();
+      break;
+    }
+  }
+  
   return data;
+}
+
+// Text-to-Speech using ElevenLabs
+async function textToSpeech(text) {
+  try {
+    const response = await axios.post(
+      `https://api.elevenlabs.io/v1/text-to-speech/${process.env.ELEVENLABS_VOICE_ID || '21m00Tcm4TlvDq8ikWAM'}`,
+      {
+        text: text,
+        model_id: 'eleven_turbo_v2',
+        voice_settings: {
+          stability: 0.5,
+          similarity_boost: 0.75
+        }
+      },
+      {
+        headers: {
+          'Accept': 'audio/mpeg',
+          'xi-api-key': process.env.ELEVENLABS_API_KEY,
+          'Content-Type': 'application/json'
+        },
+        responseType: 'arraybuffer'
+      }
+    );
+    
+    return Buffer.from(response.data);
+  } catch (error) {
+    console.error('TTS error:', error.message);
+    return null;
+  }
 }
 
 // Start server
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`
-╔════════════════════════════════════════════╗
-║   🏥 Clinic Voice Agent (FREE Version)    ║
-╠════════════════════════════════════════════╣
-║  Port: ${PORT}                              
-║  Clinic: ${process.env.CLINIC_NAME}       
-║  Type: ${process.env.CLINIC_TYPE}          
-╠════════════════════════════════════════════╣
-║  🆓 FREE SERVICES USED:                    ║
-║  ✅ Twilio (Trial)                         ║
-║  ✅ Groq AI (Free Unlimited)               ║
-║  ✅ Supabase (Free Tier)                   ║
-╠════════════════════════════════════════════╣
-║  Endpoints:                                ║
-║  📞 Voice: POST /voice                     ║
-║  💬 WhatsApp: POST /whatsapp               ║
-║  📱 SMS: POST /sms                         ║
-║  📊 Status: GET /status                    ║
-╚════════════════════════════════════════════╝
-  `);
+const server = app.listen(PORT, () => {
+  console.log('==============================================');
+  console.log('   Clinic Voice Agent + AI Calling');
+  console.log('==============================================');
+  console.log('  Port:', PORT);
+  console.log('  Clinic:', process.env.CLINIC_NAME || 'Dental Clinic');
+  console.log('  Type:', process.env.CLINIC_TYPE || 'dentist');
+  console.log('==============================================');
+  console.log('  VOICE AI CALLING ENABLED:');
+  console.log('  - Real-time speech recognition');
+  console.log('  - AI conversation (Groq)');
+  console.log('  - Natural voice synthesis');
+  console.log('==============================================');
+  console.log('  FREE SERVICES USED:');
+  console.log('  - Twilio (Trial)');
+  console.log('  - Deepgram STT (Free 45K min)');
+  console.log('  - Groq AI (Free Unlimited)');
+  console.log('  - ElevenLabs TTS (Free 10K chars)');
+  console.log('  - Supabase (Free Tier)');
+  console.log('==============================================');
+  console.log('  Endpoints:');
+  console.log('  - Voice: POST /voice');
+  console.log('  - Stream: WS /voice-stream');
+  console.log('  - WhatsApp: POST /whatsapp');
+  console.log('  - SMS: POST /sms');
+  console.log('  - Status: GET /status');
+  console.log('==============================================');
 });
+
+// WebSocket Server for Voice Streaming
+const wss = new WebSocket.Server({ noServer: true });
+
+server.on('upgrade', (request, socket, head) => {
+  const pathname = new URL(request.url, 'http://localhost').pathname;
+  
+  if (pathname === '/voice-stream') {
+    wss.handleUpgrade(request, socket, head, (ws) => {
+      wss.emit('connection', ws, request);
+    });
+  } else {
+    socket.destroy();
+  }
+});
+
+wss.on('connection', async (ws) => {
+  console.log('Voice stream connected');
+  
+  let callSid = null;
+  let streamSid = null;
+  let callerNumber = null;
+  let deepgramConnection = null;
+  
+  // Conversation for this call
+  let conversation = {
+    messages: [],
+    lastTranscript: ''
+  };
+  
+  try {
+    // Connect to Deepgram
+    const deepgram = createDeepgramClient(process.env.DEEPGRAM_API_KEY);
+    
+    deepgramConnection = deepgram.listen.live({
+      model: 'nova-2',
+      language: 'en',
+      smart_format: true,
+      interim_results: false,
+      utterance_end_ms: 1000
+    });
+    
+    console.log('Connected to Deepgram');
+    
+    // Handle transcription
+    deepgramConnection.on('transcript', async (data) => {
+      const transcript = data.channel?.alternatives?.[0]?.transcript;
+      
+      if (transcript && transcript.trim().length > 0 && transcript !== conversation.lastTranscript) {
+        conversation.lastTranscript = transcript;
+        console.log('Patient said:', transcript);
+        
+        // Add to conversation
+        conversation.messages.push({
+          role: 'user',
+          content: transcript
+        });
+        
+        try {
+          // Get AI response
+          const messages = [
+            { role: 'system', content: clinicContext },
+            ...conversation.messages
+          ];
+          
+          const response = await axios.post(
+            'https://api.groq.com/openai/v1/chat/completions',
+            {
+              model: 'llama-3.3-70b-versatile',
+              messages: messages,
+              max_tokens: 100,
+              temperature: 0.7
+            },
+            {
+              headers: {
+                'Authorization': `Bearer ${process.env.GROQ_API_KEY}`,
+                'Content-Type': 'application/json'
+              }
+            }
+          );
+          
+          const aiResponse = response.data.choices[0].message.content;
+          console.log('AI responds:', aiResponse);
+          
+          // Add to conversation
+          conversation.messages.push({
+            role: 'assistant',
+            content: aiResponse
+          });
+          
+          // Convert to speech
+          const audioData = await textToSpeech(aiResponse);
+          
+          if (audioData && streamSid) {
+            sendAudioToTwilio(ws, streamSid, audioData);
+          }
+          
+          // Check if appointment complete
+          if (aiResponse.toLowerCase().includes('confirmed')) {
+            await saveAppointment(callerNumber, conversation);
+          }
+          
+        } catch (error) {
+          console.error('Error processing:', error.message);
+        }
+      }
+    });
+    
+  } catch (error) {
+    console.error('Deepgram error:', error.message);
+  }
+  
+  // Handle Twilio messages
+  ws.on('message', async (message) => {
+    try {
+      const msg = JSON.parse(message);
+      
+      switch (msg.event) {
+        case 'start':
+          callSid = msg.start.callSid;
+          streamSid = msg.start.streamSid;
+          
+          try {
+            const call = await twilioClient.calls(callSid).fetch();
+            callerNumber = call.from;
+            console.log('Call started:', callSid);
+          } catch (error) {
+            console.error('Error:', error.message);
+          }
+          break;
+          
+        case 'media':
+          if (deepgramConnection && msg.media.payload) {
+            const audio = Buffer.from(msg.media.payload, 'base64');
+            deepgramConnection.send(audio);
+          }
+          break;
+          
+        case 'stop':
+          console.log('Call ended');
+          if (deepgramConnection) {
+            deepgramConnection.finish();
+          }
+          break;
+      }
+    } catch (error) {
+      console.error('WebSocket error:', error.message);
+    }
+  });
+  
+  ws.on('close', () => {
+    console.log('WebSocket closed');
+    if (deepgramConnection) {
+      deepgramConnection.finish();
+    }
+  });
+});
+
+// Send audio back to Twilio
+function sendAudioToTwilio(ws, streamSid, audioBuffer) {
+  try {
+    const base64Audio = audioBuffer.toString('base64');
+    
+    // Send in chunks
+    const chunkSize = 8000;
+    for (let i = 0; i < base64Audio.length; i += chunkSize) {
+      const chunk = base64Audio.slice(i, i + chunkSize);
+      
+      ws.send(JSON.stringify({
+        event: 'media',
+        streamSid: streamSid,
+        media: { payload: chunk }
+      }));
+    }
+  } catch (error) {
+    console.error('Send audio error:', error.message);
+  }
+}
